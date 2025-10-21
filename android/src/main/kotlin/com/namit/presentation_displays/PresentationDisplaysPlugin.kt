@@ -165,10 +165,10 @@ class PresentationDisplaysPlugin :
           Log.i(TAG, "display: $display")
           listJson.add(
             DisplayJson(
-              id = display.displayId,
-              flags = display.flags,
-              rotation = display.rotation,
-              name = display.name
+              display.displayId,
+              display.flags,
+              display.rotation,
+              display.name
             )
           )
         }
@@ -246,11 +246,3 @@ class DisplayConnectedStreamHandler(private var displayManager: DisplayManager?)
     displayManager?.unregisterDisplayListener(displayListener)
   }
 }
-
-/** POJO untuk serialisasi info Display */
-data class DisplayJson(
-  val id: Int,
-  val flags: Int,
-  val rotation: Int,
-  val name: String
-)
