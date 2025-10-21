@@ -1,6 +1,6 @@
 package com.namit.presentation_displays
 
-import android.content.ContentValues.TAG
+import android.app.Activity
 import android.content.Context
 import android.hardware.display.DisplayManager
 import android.os.Handler
@@ -19,96 +19,130 @@ import io.flutter.embedding.engine.plugins.activity.ActivityPluginBinding
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
-import io.flutter.plugin.common.PluginRegistry
 import org.json.JSONObject
 
-/** PresentationDisplaysPlugin */
-class PresentationDisplaysPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandler {
+/** PresentationDisplaysPlugin (Embedding V2) */
+class PresentationDisplaysPlugin :
+  FlutterPlugin,
+  ActivityAware,
+  MethodChannel.MethodCallHandler {
 
   private lateinit var channel: MethodChannel
   private lateinit var eventChannel: EventChannel
+
+  // Channel untuk kirim data ke engine di presentation
   private var flutterEngineChannel: MethodChannel? = null
-  private var context: Context? = null
+
+  // Context: default = applicationContext; akan dioverride ke activity saat available
+  private var appContext: Context? = null
+  private var activity: Activity? = null
+  private var displayManager: DisplayManager? = null
+
   private var presentation: PresentationDisplay? = null
 
-  override fun onAttachedToEngine(
-      @NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding
-  ) {
-    channel = MethodChannel(flutterPluginBinding.binaryMessenger, viewTypeId)
+  override fun onAttachedToEngine(@NonNull binding: FlutterPlugin.FlutterPluginBinding) {
+    appContext = binding.applicationContext
+    displayManager =
+      appContext?.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+
+    channel = MethodChannel(binding.binaryMessenger, VIEW_TYPE_ID)
     channel.setMethodCallHandler(this)
 
-    eventChannel = EventChannel(flutterPluginBinding.binaryMessenger, viewTypeEventsId)
-    displayManager =
-        flutterPluginBinding.applicationContext.getSystemService(Context.DISPLAY_SERVICE) as
-            DisplayManager
+    eventChannel = EventChannel(binding.binaryMessenger, VIEW_TYPE_EVENTS_ID)
     val displayConnectedStreamHandler = DisplayConnectedStreamHandler(displayManager)
     eventChannel.setStreamHandler(displayConnectedStreamHandler)
-  }
-
-  companion object {
-    private const val viewTypeId = "presentation_displays_plugin"
-    private const val viewTypeEventsId = "presentation_displays_plugin_events"
-    private var displayManager: DisplayManager? = null
-
-    /** @hide */
-    @Suppress("unused", "DEPRECATION")
-    @JvmStatic
-    fun registerWith(registrar: PluginRegistry.Registrar) {
-      val channel = MethodChannel(registrar.messenger(), viewTypeId)
-      channel.setMethodCallHandler(PresentationDisplaysPlugin())
-
-      val eventChannel = EventChannel(registrar.messenger(), viewTypeEventsId)
-      displayManager =
-          registrar.activity()!!.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-      val displayConnectedStreamHandler = DisplayConnectedStreamHandler(displayManager)
-      eventChannel.setStreamHandler(displayConnectedStreamHandler)
-    }
   }
 
   override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
     channel.setMethodCallHandler(null)
     eventChannel.setStreamHandler(null)
+    flutterEngineChannel = null
+    // Tutup presentation kalau masih tampil
+    presentation?.dismiss()
+    presentation = null
+    displayManager = null
+    appContext = null
+  }
+
+  // ActivityAware
+  override fun onAttachedToActivity(binding: ActivityPluginBinding) {
+    activity = binding.activity
+    // Boleh pakai activity sebagai context aktif
+    displayManager =
+      activity?.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+  }
+
+  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {
+    activity = binding.activity
+    displayManager =
+      activity?.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+  }
+
+  override fun onDetachedFromActivityForConfigChanges() {
+    activity = null
+    // Kembali pakai appContext jika ada
+    displayManager =
+      appContext?.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+  }
+
+  override fun onDetachedFromActivity() {
+    activity = null
+    displayManager =
+      appContext?.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
   }
 
   override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
-    Log.i(TAG, "Channel: method: ${call.method} | arguments: ${call.arguments}")
+    Log.i(TAG, "method=${call.method} args=${call.arguments}")
+
     when (call.method) {
       "showPresentation" -> {
         try {
           val obj = JSONObject(call.arguments as String)
-          Log.i(
-              TAG,
-              "Channel: method: ${call.method} | displayId: ${obj.getInt("displayId")} | routerName: ${
-              obj.getString("routerName")
-            }"
-          )
           val displayId: Int = obj.getInt("displayId")
           val tag: String = obj.getString("routerName")
-          val display = displayManager?.getDisplay(displayId)
-          if (display != null) {
-            val flutterEngine = createFlutterEngine(tag)
-            flutterEngine?.let {
-              flutterEngineChannel =
-                  MethodChannel(it.dartExecutor.binaryMessenger, "${viewTypeId}_engine")
-              presentation = context?.let { it1 -> PresentationDisplay(it1, tag, display) }
-              Log.i(TAG, "presentation: $presentation")
-              presentation?.show()
 
-              result.success(true)
-            }
-                ?: result.error("404", "Can't find FlutterEngine", null)
-          } else {
-            result.error("404", "Can't find display with displayId is $displayId", null)
+          val dm = displayManager
+          val disp = dm?.getDisplay(displayId)
+          if (disp == null) {
+            result.error("404", "Can't find display with displayId=$displayId", null)
+            return
           }
+
+          val engine = createFlutterEngine(tag)
+          if (engine == null) {
+            result.error("404", "Can't create/find FlutterEngine (tag=$tag)", null)
+            return
+          }
+
+          // Channel untuk kirim data ke engine di layar eksternal
+          flutterEngineChannel =
+            MethodChannel(engine.dartExecutor.binaryMessenger, "${VIEW_TYPE_ID}_engine")
+
+          // Tutup presentation lama jika ada
+          presentation?.dismiss()
+          presentation = null
+
+          // Context yang aman untuk Presentation: pakai activity kalau ada, fallback ke appContext
+          val ctx = activity ?: appContext
+          if (ctx == null) {
+            result.error("NO_CTX", "Context not available", null)
+            return
+          }
+
+          val pres = PresentationDisplay(ctx, tag, disp)
+          pres.show()
+          presentation = pres
+
+          result.success(true)
         } catch (e: Exception) {
           result.error(call.method, e.message, null)
         }
       }
+
       "hidePresentation" -> {
         try {
-          val obj = JSONObject(call.arguments as String)
-          Log.i(TAG, "Channel: method: ${call.method} | displayId: ${obj.getInt("displayId")}")
-
+          // argumen tidak dipakai, tapi kita tetap parse agar kompatibel
+          // val obj = JSONObject(call.arguments as String)
           presentation?.dismiss()
           presentation = null
           result.success(true)
@@ -116,19 +150,31 @@ class PresentationDisplaysPlugin : FlutterPlugin, ActivityAware, MethodChannel.M
           result.error(call.method, e.message, null)
         }
       }
+
       "listDisplay" -> {
+        val dm = displayManager
+        val category = call.arguments as? String
+        val displays: Array<Display>? = if (category.isNullOrBlank()) {
+          dm?.displays
+        } else {
+          dm?.getDisplays(category)
+        }
+
         val listJson = ArrayList<DisplayJson>()
-        val category = call.arguments
-        val displays = displayManager?.getDisplays(category as String?)
-        if (displays != null) {
-          for (display: Display in displays) {
-            Log.i(TAG, "display: $display")
-            val d = DisplayJson(display.displayId, display.flags, display.rotation, display.name)
-            listJson.add(d)
-          }
+        displays?.forEach { display ->
+          Log.i(TAG, "display: $display")
+          listJson.add(
+            DisplayJson(
+              id = display.displayId,
+              flags = display.flags,
+              rotation = display.rotation,
+              name = display.name
+            )
+          )
         }
         result.success(Gson().toJson(listJson))
       }
+
       "transferDataToPresentation" -> {
         try {
           flutterEngineChannel?.invokeMethod("DataTransfer", call.arguments)
@@ -137,54 +183,56 @@ class PresentationDisplaysPlugin : FlutterPlugin, ActivityAware, MethodChannel.M
           result.success(false)
         }
       }
+
+      else -> result.notImplemented()
     }
   }
 
   private fun createFlutterEngine(tag: String): FlutterEngine? {
-    if (context == null) return null
+    // Pakai activity kalau ada, fallback ke appContext
+    val ctx = activity ?: appContext ?: return null
+
     if (FlutterEngineCache.getInstance().get(tag) == null) {
-      val flutterEngine = FlutterEngine(context!!)
+      val flutterEngine = FlutterEngine(ctx)
+      // Set initial route sesuai "routerName"
       flutterEngine.navigationChannel.setInitialRoute(tag)
-      FlutterInjector.instance().flutterLoader().startInitialization(context!!)
+
+      // Init & jalankan entrypoint khusus
+      FlutterInjector.instance().flutterLoader().startInitialization(ctx)
       val path = FlutterInjector.instance().flutterLoader().findAppBundlePath()
       val entrypoint = DartExecutor.DartEntrypoint(path, "secondaryDisplayMain")
       flutterEngine.dartExecutor.executeDartEntrypoint(entrypoint)
       flutterEngine.lifecycleChannel.appIsResumed()
-      // Cache the FlutterEngine to be used by FlutterActivity.
+
+      // Cache supaya bisa di-attach oleh PresentationDisplay
       FlutterEngineCache.getInstance().put(tag, flutterEngine)
     }
     return FlutterEngineCache.getInstance().get(tag)
   }
 
-  override fun onDetachedFromActivity() {}
-
-  override fun onReattachedToActivityForConfigChanges(binding: ActivityPluginBinding) {}
-
-  override fun onAttachedToActivity(binding: ActivityPluginBinding) {
-    this.context = binding.activity
-    displayManager = context?.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+  companion object {
+    private const val TAG = "PresentationDisplays"
+    private const val VIEW_TYPE_ID = "presentation_displays_plugin"
+    private const val VIEW_TYPE_EVENTS_ID = "presentation_displays_plugin_events"
   }
-
-  override fun onDetachedFromActivityForConfigChanges() {}
 }
 
+/** Stream handler untuk event add/remove external display */
 class DisplayConnectedStreamHandler(private var displayManager: DisplayManager?) :
-    EventChannel.StreamHandler {
+  EventChannel.StreamHandler {
   private var sink: EventChannel.EventSink? = null
   private var handler: Handler? = null
 
   private val displayListener =
-      object : DisplayManager.DisplayListener {
-        override fun onDisplayAdded(displayId: Int) {
-          sink?.success(1)
-        }
-
-        override fun onDisplayRemoved(displayId: Int) {
-          sink?.success(0)
-        }
-
-        override fun onDisplayChanged(p0: Int) {}
+    object : DisplayManager.DisplayListener {
+      override fun onDisplayAdded(displayId: Int) {
+        sink?.success(1)
       }
+      override fun onDisplayRemoved(displayId: Int) {
+        sink?.success(0)
+      }
+      override fun onDisplayChanged(displayId: Int) { /* no-op */ }
+    }
 
   override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
     sink = events
@@ -198,3 +246,11 @@ class DisplayConnectedStreamHandler(private var displayManager: DisplayManager?)
     displayManager?.unregisterDisplayListener(displayListener)
   }
 }
+
+/** POJO untuk serialisasi info Display */
+data class DisplayJson(
+  val id: Int,
+  val flags: Int,
+  val rotation: Int,
+  val name: String
+)
